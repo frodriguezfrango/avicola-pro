@@ -107,7 +107,8 @@ function createSession(user, res) {
         id: user.id,
         username: user.username,
         role: user.role,
-        name: user.name
+        name: user.name,
+        mustChangePassword: !!user.mustChangePassword
     };
     sessions.set(sid, sessionData);
     res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax`);
@@ -218,6 +219,43 @@ const server = http.createServer(async (req, res) => {
             return sendJson(res, 200, { loggedIn: true, user });
         }
         return sendJson(res, 200, { loggedIn: false });
+    }
+
+    // 4. Autenticación: POST /api/auth/change-password
+    if (pathname === '/api/auth/change-password' && method === 'POST') {
+        const currentUser = getSessionUser(req);
+        if (!currentUser) {
+            return sendJson(res, 401, { error: 'No autorizado. Inicie sesión.' });
+        }
+        try {
+            const { oldPassword, newPassword } = await getJsonBody(req);
+            if (!newPassword || newPassword.trim().length < 4) {
+                return sendJson(res, 400, { error: 'La nueva contraseña debe tener al menos 4 caracteres.' });
+            }
+            users = loadUsers();
+            const userIdx = users.findIndex(u => u.id === currentUser.id);
+            if (userIdx === -1) {
+                return sendJson(res, 404, { error: 'Usuario no encontrado.' });
+            }
+            const user = users[userIdx];
+
+            // Si NO es cambio obligatorio inicial, requerir contraseña anterior
+            if (!user.mustChangePassword) {
+                if (!oldPassword || !verifyPassword(oldPassword, user.passwordHash)) {
+                    return sendJson(res, 400, { error: 'La contraseña actual es incorrecta.' });
+                }
+            }
+
+            user.passwordHash = hashPassword(newPassword.trim());
+            user.mustChangePassword = false;
+            users[userIdx] = user;
+            atomicWriteJson(USERS_FILE, users);
+
+            currentUser.mustChangePassword = false;
+            return sendJson(res, 200, { success: true });
+        } catch (e) {
+            return sendJson(res, 400, { error: 'Error al cambiar contraseña.' });
+        }
     }
 
     // Proteger todas las siguientes rutas /api con autenticación
@@ -371,6 +409,7 @@ const server = http.createServer(async (req, res) => {
                     passwordHash: hashPassword(password),
                     role: ['admin', 'operator', 'read'].includes(role) ? role : 'operator',
                     name: name.trim(),
+                    mustChangePassword: true, // Forzar cambio de clave en primer ingreso
                     createdAt: new Date().toISOString()
                 };
 
@@ -381,6 +420,30 @@ const server = http.createServer(async (req, res) => {
                 return sendJson(res, 200, { success: true, user: safeUser });
             } catch (e) {
                 return sendJson(res, 400, { error: 'Error creando usuario.' });
+            }
+        }
+
+        if (pathname === '/api/users/reset-password' && method === 'POST') {
+            if (currentUser.role !== 'admin') {
+                return sendJson(res, 403, { error: 'Acceso exclusivo para Administradores.' });
+            }
+            try {
+                const { userId, newPassword } = await getJsonBody(req);
+                if (!userId || !newPassword || newPassword.trim().length < 4) {
+                    return sendJson(res, 400, { error: 'Ingrese una contraseña válida (mín. 4 caracteres).' });
+                }
+                users = loadUsers();
+                const targetUser = users.find(u => u.id === userId);
+                if (!targetUser) {
+                    return sendJson(res, 404, { error: 'Usuario no encontrado.' });
+                }
+                targetUser.passwordHash = hashPassword(newPassword.trim());
+                targetUser.mustChangePassword = true; // Exigir cambio en primer ingreso tras reseteo
+                atomicWriteJson(USERS_FILE, users);
+
+                return sendJson(res, 200, { success: true, username: targetUser.username });
+            } catch (e) {
+                return sendJson(res, 400, { error: 'Error al resetear contraseña.' });
             }
         }
 
