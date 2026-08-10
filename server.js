@@ -243,6 +243,42 @@ const server = http.createServer(async (req, res) => {
                 if (!newDb || typeof newDb !== 'object') {
                     return sendJson(res, 400, { error: 'Datos no válidos.' });
                 }
+
+                // Restauración de Usuarios opcional si vienen en el respaldo (Solo Admin)
+                if (newDb.users && Array.isArray(newDb.users) && currentUser.role === 'admin') {
+                    const currentUsers = loadUsers();
+                    const restoredUsers = newDb.users.map(u => {
+                        const existing = currentUsers.find(cu => cu.username.toLowerCase() === u.username.toLowerCase());
+                        return {
+                            id: u.id || ('usr_' + Date.now() + Math.random().toString(36).substring(2, 5)),
+                            username: u.username.toLowerCase(),
+                            passwordHash: u.passwordHash || (existing ? existing.passwordHash : hashPassword('123456')),
+                            role: u.role || 'operator',
+                            name: u.name || u.username,
+                            createdAt: u.createdAt || new Date().toISOString()
+                        };
+                    });
+
+                    // Garantizar presencia de usuario admin
+                    if (!restoredUsers.some(u => u.username === 'admin')) {
+                        const adminUser = currentUsers.find(u => u.username === 'admin') || {
+                            id: 'usr_admin_default',
+                            username: 'admin',
+                            passwordHash: hashPassword('admin123'),
+                            role: 'admin',
+                            name: 'Administrador General',
+                            createdAt: new Date().toISOString()
+                        };
+                        restoredUsers.unshift(adminUser);
+                    }
+
+                    users = restoredUsers;
+                    atomicWriteJson(USERS_FILE, users);
+                    delete newDb.users;
+                } else if (newDb.users) {
+                    delete newDb.users;
+                }
+
                 dbData = newDb;
                 atomicWriteJson(DB_FILE, dbData);
                 return sendJson(res, 200, { success: true });
