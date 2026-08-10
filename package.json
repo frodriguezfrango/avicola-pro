@@ -1,0 +1,16 @@
+{
+  "name": "avicola-pro",
+  "version": "40.5.0",
+  "description": "Sistema de Pago a Proveedores, Clientes, E-CHEQ, Cash y Gestión Financiera Multiusuario - Avícola Pro v40.5",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0"
+  }
+}
