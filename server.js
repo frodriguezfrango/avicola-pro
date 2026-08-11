@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const url = require('url');
 
 const PORT = process.env.PORT || 3000;
+const MONGODB_URI = process.env.MONGODB_URI || process.env.DATABASE_URL;
 
 // Directorios y Archivos
 const DATA_DIR = path.join(__dirname, 'data');
@@ -12,7 +13,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
-// Crear directorio data si no existe
+// Crear directorio data si no existe (para fallback local)
 if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -26,14 +27,23 @@ function verifyPassword(password, hash) {
     return hashPassword(password) === hash;
 }
 
-// Gestor Atómico de Archivos JSON
+// ---------------------------------------------------------
+// CAPA DE ALMACENAMIENTO MULTI-NUBE (Firebase / MongoDB / JSON Local)
+// ---------------------------------------------------------
+let admin = null;
+let firestoreDb = null;
+let mongoClient = null;
+let mongoDb = null;
+let activeDbMode = 'local'; // 'firebase', 'mongodb', 'local'
+
+// Gestor Atómico de Archivos JSON (Local)
 function atomicWriteJson(filePath, data) {
     const tmpPath = `${filePath}.${Date.now()}.${Math.random().toString(36).substring(2, 7)}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
     fs.renameSync(tmpPath, filePath);
 }
 
-function loadUsers() {
+function loadUsersLocal() {
     if (!fs.existsSync(USERS_FILE)) {
         const defaultUsers = [
             {
@@ -52,12 +62,12 @@ function loadUsers() {
         const raw = fs.readFileSync(USERS_FILE, 'utf8');
         return JSON.parse(raw);
     } catch (e) {
-        console.error("Error leyendo users.json:", e);
+        console.error("Error leyendo users.json local:", e);
         return [];
     }
 }
 
-function loadDb() {
+function loadDbLocal() {
     const defaultStructure = { e: [], p: [], c: [], m: [], eq: [], notas: [], cashPayments: [], finReports: [] };
     if (!fs.existsSync(DB_FILE)) {
         atomicWriteJson(DB_FILE, defaultStructure);
@@ -68,16 +78,212 @@ function loadDb() {
         const parsed = JSON.parse(raw);
         return { ...defaultStructure, ...parsed };
     } catch (e) {
-        console.error("Error leyendo db.json:", e);
+        console.error("Error leyendo db.json local:", e);
         return defaultStructure;
     }
 }
 
-// Carga Inicial de Datos
-let users = loadUsers();
-let dbData = loadDb();
+// Inicializar almacenamiento al arrancar
+async function initStorage() {
+    // 1. Probar Firebase Firestore si existe FIREBASE_SERVICE_ACCOUNT
+    const firebaseAccountRaw = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (firebaseAccountRaw) {
+        try {
+            console.log('[DB] Conectando a Firebase Cloud Firestore...');
+            admin = require('firebase-admin');
+            const serviceAccount = typeof firebaseAccountRaw === 'string' && firebaseAccountRaw.startsWith('{') 
+                ? JSON.parse(firebaseAccountRaw) 
+                : require(path.resolve(firebaseAccountRaw));
+                
+            admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount)
+            });
+            firestoreDb = admin.firestore();
+            activeDbMode = 'firebase';
+            console.log('[DB] ✅ Conexión exitosa a Firebase Cloud Firestore');
 
-// Sistema de Sesiones en Memoria
+            const usersSnap = await firestoreDb.collection('users').get();
+            if (usersSnap.empty) {
+                console.log('[DB] Firestore "users" vacía. Inicializando usuarios...');
+                const initialUsers = loadUsersLocal();
+                for (const u of initialUsers) {
+                    await firestoreDb.collection('users').doc(u.id).set(u);
+                }
+            }
+
+            const dataDocRef = firestoreDb.collection('app_data').doc('main_db');
+            const dataSnap = await dataDocRef.get();
+            if (!dataSnap.exists) {
+                console.log('[DB] Firestore "app_data/main_db" no encontrado. Inicializando base de datos...');
+                const initialDb = loadDbLocal();
+                await dataDocRef.set({ ...initialDb, updatedAt: new Date().toISOString() });
+            }
+            return;
+        } catch (err) {
+            console.error('[DB] ❌ Error conectando a Firebase:', err.message);
+        }
+    }
+
+    // 2. Probar MongoDB Atlas si existe MONGODB_URI
+    if (MONGODB_URI) {
+        try {
+            console.log('[DB] Conectando a MongoDB Atlas...');
+            const { MongoClient } = require('mongodb');
+            mongoClient = new MongoClient(MONGODB_URI, {
+                connectTimeoutMS: 10000,
+                serverSelectionTimeoutMS: 10000
+            });
+            await mongoClient.connect();
+            mongoDb = mongoClient.db();
+            activeDbMode = 'mongodb';
+            console.log('[DB] ✅ Conexión exitosa a MongoDB Atlas');
+
+            const usersColl = mongoDb.collection('users');
+            const userCount = await usersColl.countDocuments();
+            if (userCount === 0) {
+                console.log('[DB] MongoDB "users" vacía. Inicializando usuarios...');
+                const initialUsers = loadUsersLocal();
+                if (initialUsers.length > 0) {
+                    await usersColl.insertMany(initialUsers.map(u => ({ ...u })));
+                }
+            }
+
+            const dataColl = mongoDb.collection('app_data');
+            const dataDoc = await dataColl.findOne({ _id: 'main_db' });
+            if (!dataDoc) {
+                console.log('[DB] MongoDB "app_data/main_db" no encontrado. Inicializando base de datos...');
+                const initialDb = loadDbLocal();
+                await dataColl.updateOne(
+                    { _id: 'main_db' },
+                    { $set: { ...initialDb, updatedAt: new Date().toISOString() } },
+                    { upsert: true }
+                );
+            }
+            return;
+        } catch (err) {
+            console.error('[DB] ❌ Error conectando a MongoDB Atlas:', err.message);
+        }
+    }
+
+    // 3. Fallback a Archivos JSON Locales
+    console.log('[DB] MONGODB_URI ni FIREBASE_SERVICE_ACCOUNT detectados. Utilizando almacenamiento JSON local.');
+    activeDbMode = 'local';
+}
+
+async function getUsers() {
+    if (activeDbMode === 'firebase' && firestoreDb) {
+        try {
+            const snap = await firestoreDb.collection('users').get();
+            const list = [];
+            snap.forEach(doc => list.push(doc.data()));
+            return list;
+        } catch (e) {
+            console.error('[DB] Error leyendo usuarios de Firebase:', e);
+            return loadUsersLocal();
+        }
+    }
+    if (activeDbMode === 'mongodb' && mongoDb) {
+        try {
+            const list = await mongoDb.collection('users').find({}).toArray();
+            return list.map(({ _id, ...u }) => u);
+        } catch (e) {
+            console.error('[DB] Error leyendo usuarios de MongoDB:', e);
+            return loadUsersLocal();
+        }
+    }
+    return loadUsersLocal();
+}
+
+async function saveUsers(usersList) {
+    if (activeDbMode === 'firebase' && firestoreDb) {
+        try {
+            const batch = firestoreDb.batch();
+            const snap = await firestoreDb.collection('users').get();
+            snap.forEach(doc => batch.delete(doc.ref));
+            for (const u of usersList) {
+                const ref = firestoreDb.collection('users').doc(u.id || ('usr_' + Date.now()));
+                batch.set(ref, u);
+            }
+            await batch.commit();
+            return;
+        } catch (e) {
+            console.error('[DB] Error guardando usuarios en Firebase:', e);
+        }
+    }
+    if (activeDbMode === 'mongodb' && mongoDb) {
+        try {
+            const usersColl = mongoDb.collection('users');
+            await usersColl.deleteMany({});
+            if (usersList.length > 0) {
+                await usersColl.insertMany(usersList.map(u => ({ ...u })));
+            }
+            return;
+        } catch (e) {
+            console.error('[DB] Error guardando usuarios en MongoDB:', e);
+        }
+    }
+    atomicWriteJson(USERS_FILE, usersList);
+}
+
+async function getDbData() {
+    const defaultStructure = { e: [], p: [], c: [], m: [], eq: [], notas: [], cashPayments: [], finReports: [] };
+    if (activeDbMode === 'firebase' && firestoreDb) {
+        try {
+            const snap = await firestoreDb.collection('app_data').doc('main_db').get();
+            if (snap.exists) {
+                const { updatedAt, ...data } = snap.data();
+                return { ...defaultStructure, ...data };
+            }
+        } catch (e) {
+            console.error('[DB] Error leyendo dbData de Firebase:', e);
+            return loadDbLocal();
+        }
+    }
+    if (activeDbMode === 'mongodb' && mongoDb) {
+        try {
+            const doc = await mongoDb.collection('app_data').findOne({ _id: 'main_db' });
+            if (doc) {
+                const { _id, updatedAt, ...data } = doc;
+                return { ...defaultStructure, ...data };
+            }
+        } catch (e) {
+            console.error('[DB] Error leyendo dbData de MongoDB:', e);
+            return loadDbLocal();
+        }
+    }
+    return loadDbLocal();
+}
+
+async function saveDbData(dataObj) {
+    if (activeDbMode === 'firebase' && firestoreDb) {
+        try {
+            await firestoreDb.collection('app_data').doc('main_db').set({
+                ...dataObj,
+                updatedAt: new Date().toISOString()
+            });
+            return;
+        } catch (e) {
+            console.error('[DB] Error guardando dbData en Firebase:', e);
+        }
+    }
+    if (activeDbMode === 'mongodb' && mongoDb) {
+        try {
+            await mongoDb.collection('app_data').updateOne(
+                { _id: 'main_db' },
+                { $set: { ...dataObj, updatedAt: new Date().toISOString() } },
+                { upsert: true }
+            );
+            return;
+        } catch (e) {
+            console.error('[DB] Error guardando dbData en MongoDB:', e);
+        }
+    }
+    atomicWriteJson(DB_FILE, dataObj);
+}
+
+// ---------------------------------------------------------
+// SISTEMA DE SESIONES EN MEMORIA
+// ---------------------------------------------------------
 const sessions = new Map();
 
 function parseCookies(req) {
@@ -191,7 +397,7 @@ const server = http.createServer(async (req, res) => {
                 return sendJson(res, 400, { error: 'Ingrese usuario y contraseña.' });
             }
 
-            users = loadUsers();
+            const users = await getUsers();
             const cleanUser = username.trim().toLowerCase();
             const user = users.find(u => u.username.toLowerCase() === cleanUser);
 
@@ -232,14 +438,13 @@ const server = http.createServer(async (req, res) => {
             if (!newPassword || newPassword.trim().length < 4) {
                 return sendJson(res, 400, { error: 'La nueva contraseña debe tener al menos 4 caracteres.' });
             }
-            users = loadUsers();
+            const users = await getUsers();
             const userIdx = users.findIndex(u => u.id === currentUser.id);
             if (userIdx === -1) {
                 return sendJson(res, 404, { error: 'Usuario no encontrado.' });
             }
             const user = users[userIdx];
 
-            // Si NO es cambio obligatorio inicial, requerir contraseña anterior
             if (!user.mustChangePassword) {
                 if (!oldPassword || !verifyPassword(oldPassword, user.passwordHash)) {
                     return sendJson(res, 400, { error: 'La contraseña actual es incorrecta.' });
@@ -249,7 +454,7 @@ const server = http.createServer(async (req, res) => {
             user.passwordHash = hashPassword(newPassword.trim());
             user.mustChangePassword = false;
             users[userIdx] = user;
-            atomicWriteJson(USERS_FILE, users);
+            await saveUsers(users);
 
             currentUser.mustChangePassword = false;
             return sendJson(res, 200, { success: true });
@@ -267,7 +472,7 @@ const server = http.createServer(async (req, res) => {
 
         // GET /api/db (Todos los roles autenticados)
         if (pathname === '/api/db' && method === 'GET') {
-            dbData = loadDb();
+            const dbData = await getDbData();
             return sendJson(res, 200, dbData);
         }
 
@@ -284,7 +489,7 @@ const server = http.createServer(async (req, res) => {
 
                 // Restauración de Usuarios opcional si vienen en el respaldo (Solo Admin)
                 if (newDb.users && Array.isArray(newDb.users) && currentUser.role === 'admin') {
-                    const currentUsers = loadUsers();
+                    const currentUsers = await getUsers();
                     const restoredUsers = newDb.users.map(u => {
                         const existing = currentUsers.find(cu => cu.username.toLowerCase() === u.username.toLowerCase());
                         return {
@@ -310,15 +515,13 @@ const server = http.createServer(async (req, res) => {
                         restoredUsers.unshift(adminUser);
                     }
 
-                    users = restoredUsers;
-                    atomicWriteJson(USERS_FILE, users);
+                    await saveUsers(restoredUsers);
                     delete newDb.users;
                 } else if (newDb.users) {
                     delete newDb.users;
                 }
 
-                dbData = newDb;
-                atomicWriteJson(DB_FILE, dbData);
+                await saveDbData(newDb);
                 return sendJson(res, 200, { success: true });
             } catch (e) {
                 return sendJson(res, 400, { error: 'Error procesando datos.' });
@@ -335,7 +538,7 @@ const server = http.createServer(async (req, res) => {
                 if (!nuevos || !Array.isArray(nuevos)) {
                     return sendJson(res, 400, { error: 'Movimientos no válidos.' });
                 }
-                dbData = loadDb();
+                const dbData = await getDbData();
                 if (!dbData.m) dbData.m = [];
 
                 const nuevosProcesados = nuevos.map(m => ({ ...m, u: m.u || currentUser.name }));
@@ -346,7 +549,7 @@ const server = http.createServer(async (req, res) => {
                     dbData.m.push(...nuevosProcesados);
                 }
 
-                atomicWriteJson(DB_FILE, dbData);
+                await saveDbData(dbData);
                 return sendJson(res, 200, { success: true });
             } catch (e) {
                 return sendJson(res, 400, { error: 'Error procesando datos.' });
@@ -360,7 +563,7 @@ const server = http.createServer(async (req, res) => {
             }
             try {
                 const { index, updatedMov } = await getJsonBody(req);
-                dbData = loadDb();
+                const dbData = await getDbData();
                 if (!dbData.m || index < 0 || index >= dbData.m.length) {
                     return sendJson(res, 400, { error: 'Movimiento no encontrado.' });
                 }
@@ -368,10 +571,10 @@ const server = http.createServer(async (req, res) => {
                 dbData.m[index] = {
                     ...dbData.m[index],
                     ...updatedMov,
-                    u: currentUser.name // Estampar nombre del usuario que editó
+                    u: currentUser.name
                 };
 
-                atomicWriteJson(DB_FILE, dbData);
+                await saveDbData(dbData);
                 return sendJson(res, 200, { success: true, updatedMov: dbData.m[index] });
             } catch (e) {
                 return sendJson(res, 400, { error: 'Error al actualizar movimiento.' });
@@ -383,7 +586,7 @@ const server = http.createServer(async (req, res) => {
             if (currentUser.role !== 'admin') {
                 return sendJson(res, 403, { error: 'Acceso exclusivo para Administradores.' });
             }
-            users = loadUsers();
+            const users = await getUsers();
             const safeUsers = users.map(({ passwordHash, ...u }) => u);
             return sendJson(res, 200, safeUsers);
         }
@@ -397,7 +600,7 @@ const server = http.createServer(async (req, res) => {
                 if (!username || !password || !role || !name) {
                     return sendJson(res, 400, { error: 'Todos los campos son requeridos.' });
                 }
-                users = loadUsers();
+                const users = await getUsers();
                 const cleanUser = username.trim().toLowerCase();
                 if (users.some(u => u.username.toLowerCase() === cleanUser)) {
                     return sendJson(res, 400, { error: `El usuario "${username}" ya existe.` });
@@ -409,12 +612,12 @@ const server = http.createServer(async (req, res) => {
                     passwordHash: hashPassword(password),
                     role: ['admin', 'operator', 'read'].includes(role) ? role : 'operator',
                     name: name.trim(),
-                    mustChangePassword: true, // Forzar cambio de clave en primer ingreso
+                    mustChangePassword: true,
                     createdAt: new Date().toISOString()
                 };
 
                 users.push(newUser);
-                atomicWriteJson(USERS_FILE, users);
+                await saveUsers(users);
 
                 const { passwordHash, ...safeUser } = newUser;
                 return sendJson(res, 200, { success: true, user: safeUser });
@@ -432,14 +635,14 @@ const server = http.createServer(async (req, res) => {
                 if (!userId || !newPassword || newPassword.trim().length < 4) {
                     return sendJson(res, 400, { error: 'Ingrese una contraseña válida (mín. 4 caracteres).' });
                 }
-                users = loadUsers();
+                const users = await getUsers();
                 const targetUser = users.find(u => u.id === userId);
                 if (!targetUser) {
                     return sendJson(res, 404, { error: 'Usuario no encontrado.' });
                 }
                 targetUser.passwordHash = hashPassword(newPassword.trim());
-                targetUser.mustChangePassword = true; // Exigir cambio en primer ingreso tras reseteo
-                atomicWriteJson(USERS_FILE, users);
+                targetUser.mustChangePassword = true;
+                await saveUsers(users);
 
                 return sendJson(res, 200, { success: true, username: targetUser.username });
             } catch (e) {
@@ -455,9 +658,9 @@ const server = http.createServer(async (req, res) => {
             if (currentUser.id === userId) {
                 return sendJson(res, 400, { error: 'No puede eliminar su propio usuario activo.' });
             }
-            users = loadUsers();
+            let users = await getUsers();
             users = users.filter(u => u.id !== userId);
-            atomicWriteJson(USERS_FILE, users);
+            await saveUsers(users);
             return sendJson(res, 200, { success: true });
         }
 
@@ -495,12 +698,15 @@ const server = http.createServer(async (req, res) => {
     });
 });
 
-// Iniciar servidor HTTP
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`====================================================`);
-    console.log(` Avícola Pro v40.5 - Servidor Multiusuario Nativo`);
-    console.log(` Estado: Activo y listo para usar en local o nube`);
-    console.log(` Puerto: ${PORT}`);
-    console.log(` Acceso Local: http://localhost:${PORT}`);
-    console.log(`====================================================`);
-});
+// Iniciar servidor HTTP tras conectar almacenamiento
+(async () => {
+    await initStorage();
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`====================================================`);
+        console.log(` Avícola Pro v40.5 - Servidor Multiusuario`);
+        console.log(` Modo de Base de Datos Activo: [${activeDbMode.toUpperCase()}]`);
+        console.log(` Puerto: ${PORT}`);
+        console.log(` Acceso Local: http://localhost:${PORT}`);
+        console.log(`====================================================`);
+    });
+})();
