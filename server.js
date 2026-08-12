@@ -111,12 +111,11 @@ async function initStorage() {
                 }
             }
 
-            const dataDocRef = firestoreDb.collection('app_data').doc('main_db');
-            const dataSnap = await dataDocRef.get();
-            if (!dataSnap.exists) {
-                console.log('[DB] Firestore "app_data/main_db" no encontrado. Inicializando base de datos...');
+            const appDataSnap = await firestoreDb.collection('app_data').get();
+            if (appDataSnap.empty) {
+                console.log('[DB] Firestore "app_data" vacía. Inicializando base de datos...');
                 const initialDb = loadDbLocal();
-                await dataDocRef.set({ ...initialDb, updatedAt: new Date().toISOString() });
+                await saveDbData(initialDb);
             }
             return;
         } catch (err) {
@@ -229,10 +228,44 @@ async function getDbData() {
     const defaultStructure = { e: [], p: [], c: [], m: [], eq: [], notas: [], cashPayments: [], finReports: [] };
     if (activeDbMode === 'firebase' && firestoreDb) {
         try {
-            const snap = await firestoreDb.collection('app_data').doc('main_db').get();
-            if (snap.exists) {
-                const { updatedAt, ...data } = snap.data();
-                return { ...defaultStructure, ...data };
+            const snap = await firestoreDb.collection('app_data').get();
+            if (!snap.empty) {
+                let result = { ...defaultStructure };
+                let mainDbData = null;
+
+                snap.forEach(doc => {
+                    if (doc.id === 'main_db') {
+                        mainDbData = doc.data();
+                    } else {
+                        const d = doc.data();
+                        if (d && d.data !== undefined) {
+                            try {
+                                result[doc.id] = JSON.parse(d.data);
+                            } catch (e) {
+                                result[doc.id] = d.data;
+                            }
+                        }
+                    }
+                });
+
+                const sectionKeysFound = snap.docs.filter(doc => doc.id !== 'main_db').length;
+                if (sectionKeysFound > 0) {
+                    return { ...defaultStructure, ...result };
+                }
+
+                if (mainDbData) {
+                    if (mainDbData.jsonPayload) {
+                        try {
+                            const parsedFull = JSON.parse(mainDbData.jsonPayload);
+                            return { ...defaultStructure, ...parsedFull };
+                        } catch (e) {
+                            console.error('[DB] Error parseando jsonPayload de main_db:', e);
+                        }
+                    } else {
+                        const { updatedAt, ...rawFields } = mainDbData;
+                        return { ...defaultStructure, ...rawFields };
+                    }
+                }
             }
         } catch (e) {
             console.error('[DB] Error leyendo dbData de Firebase:', e);
@@ -257,10 +290,35 @@ async function getDbData() {
 async function saveDbData(dataObj) {
     if (activeDbMode === 'firebase' && firestoreDb) {
         try {
-            await firestoreDb.collection('app_data').doc('main_db').set({
-                ...dataObj,
-                updatedAt: new Date().toISOString()
-            });
+            const batch = firestoreDb.batch();
+
+            // 1. Guardar documento principal metadata + payload JSON completo (si cabe)
+            const fullJson = JSON.stringify(dataObj);
+            const mainDbRef = firestoreDb.collection('app_data').doc('main_db');
+            if (fullJson.length < 850000) {
+                batch.set(mainDbRef, {
+                    jsonPayload: fullJson,
+                    updatedAt: new Date().toISOString()
+                });
+            } else {
+                batch.set(mainDbRef, {
+                    updatedAt: new Date().toISOString()
+                });
+            }
+
+            // 2. Guardar cada colección/sección (e, p, c, m, eq, notas, cashPayments, finReports, etc.)
+            // como un documento independiente serializado en la colección 'app_data'
+            for (const key of Object.keys(dataObj)) {
+                if (key === 'users') continue;
+                const docRef = firestoreDb.collection('app_data').doc(key);
+                const sectionJson = JSON.stringify(dataObj[key] !== undefined ? dataObj[key] : []);
+                batch.set(docRef, {
+                    data: sectionJson,
+                    updatedAt: new Date().toISOString()
+                });
+            }
+
+            await batch.commit();
             return;
         } catch (e) {
             console.error('[DB] Error guardando dbData en Firebase:', e);
